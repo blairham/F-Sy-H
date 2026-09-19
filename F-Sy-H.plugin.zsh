@@ -79,6 +79,11 @@ typeset -g _fsh_base_dir=$plugin_dir
 typeset -g _fsh_version=1.67.1
 typeset -ga _fsh_main_cache
 
+# The region_highlight this plugin applied on its last run. The unchanged-buffer
+# fast path in _fsh_zle_highlight recomputes nothing, so it needs a copy to
+# re-assert when another ZLE consumer has cleared region_highlight in between.
+typeset -ga _fsh_prior_region_highlight
+
 # Holds list of indices pointing at brackets that are complex, i.e. e.g. part of "[[" in [[ ... ]]
 typeset -ga _fsh_complex_brackets
 
@@ -151,7 +156,7 @@ _fsh_zle_highlight() {
 
   # Reset region highlight to build it from scratch
   # may need to remove path_prefix highlighting when the line ends
-  if [[ $WIDGET == zle-line-finish ]] || _fsh_buffer_modified; then
+  if [[ $WIDGET == zle-line-finish ]] || _fsh_buffer_modified || (( ${#region_highlight} == 0 && ${#_fsh_prior_region_highlight} > 0 )); then
     _fsh_highlight_init
     _fsh_highlight_process "$PREBUFFER" "$BUFFER" 0
     (( _fsh_state[use_brackets] )) && {
@@ -159,7 +164,17 @@ _fsh_zle_highlight() {
       _fsh_highlight_string_process "$PREBUFFER" "$BUFFER"
     }
     region_highlight=( $reply )
+    _fsh_prior_region_highlight=( $reply )
   else
+    # The buffer is unchanged, so nothing is recomputed here. That is only safe
+    # while region_highlight still holds what we applied last time. Anything
+    # else driving ZLE -- a prompt plugin redrawing between two calls for the
+    # same buffer, for instance -- can empty it first, and then this repaint
+    # would render the line with no styles at all. Re-assert the previous
+    # result instead of reparsing: same output, none of the cost.
+    if (( ${#region_highlight} == 0 && ${#_fsh_prior_region_highlight} > 0 )); then
+      region_highlight=( $_fsh_prior_region_highlight )
+    fi
     local char="${BUFFER[CURSOR+1]}"
     if [[ "$char" = ["{([])}"] || "${_fsh_state[prev_char]}" = ["{([])}"] ]]; then
       _fsh_state[prev_char]="$char"
@@ -167,6 +182,7 @@ _fsh_zle_highlight() {
         reply=( $_fsh_main_cache )
         _fsh_highlight_string_process "$PREBUFFER" "$BUFFER"
         region_highlight=( $reply )
+        _fsh_prior_region_highlight=( $reply )
       }
     fi
   fi
@@ -392,6 +408,32 @@ _fsh_bind_widgets() {
       fi
     esac
   done
+
+  # Wrapping widgets only covers redraws this plugin is on the call path for.
+  # Another plugin can redraw the line on its own -- zsh-autosuggestions does
+  # it from its async callback -- and region_highlight does not survive to
+  # that point, so the line would repaint with no styles at all. line-pre-redraw
+  # runs immediately before every redraw, whoever caused it, which is the only
+  # place that can put the styles back. Re-assert, never recompute: this runs
+  # on a hot path and the parse for this exact buffer is already done.
+  if autoload -Uz add-zle-hook-widget 2>/dev/null; then
+    zle -N -- _fsh_line_pre_redraw_hook
+    add-zle-hook-widget -- line-pre-redraw _fsh_line_pre_redraw_hook 2>/dev/null
+  fi
+}
+
+# Put back the highlighting a foreign redraw dropped. Only ever restores the
+# result already computed for this exact buffer, so it cannot show stale styles.
+_fsh_line_pre_redraw_hook() {
+  builtin emulate -L zsh ${=${options[xtrace]:#off}:+-o xtrace}
+  builtin setopt extended_glob warn_create_global typeset_silent no_short_loops rc_quotes no_auto_pushd
+
+  (( ${#region_highlight} == 0 )) || return 0
+  (( ${#_fsh_prior_region_highlight} > 0 )) || return 0
+  [[ ${_fsh_prior_buffer-} == "$BUFFER" ]] || return 0
+
+  region_highlight=( $_fsh_prior_region_highlight )
+  return 0
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -407,6 +449,8 @@ _fsh_preexec_hook() {
   typeset -gi _fsh_prior_cursor=0
   typeset -ga _fsh_main_cache
   _fsh_main_cache=()
+  typeset -ga _fsh_prior_region_highlight
+  _fsh_prior_region_highlight=()
 }
 
 if [[ -o interactive ]]; then
